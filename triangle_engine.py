@@ -196,6 +196,9 @@ MULTI_PREFIX_RE = re.compile(
 # Pattern at the start of a category label that exposes its section code
 CAT_CODE_PREFIX_RE = re.compile(r"^([A-Za-z][\w]*)\.\s*", re.IGNORECASE)
 RANK_LABEL_RE = re.compile(r"^(\d+)$")
+# LINK form for rank textboxes: "LINK <CODE>. <rank>" means this shape's own
+# section provides the values, but the rank order follows <CODE>'s W5 sort.
+LINK_LABEL_RE = re.compile(r"^LINK\s+([A-Za-z][\w]*)\.?\s*(\d+)\s*$", re.IGNORECASE)
 
 
 def parse_shape_name(name):
@@ -230,16 +233,25 @@ def parse_shape_name(name):
     label = (m.group(3) or "").strip() or None
 
     rank = None
+    link_code = None
     if label is not None:
-        rm = RANK_LABEL_RE.match(label)
-        if rm:
-            rank  = int(rm.group(1))
-            label = None  # rank replaces label
+        # "LINK <CODE>. <rank>" — rank order follows another section's W5 sort
+        lm = LINK_LABEL_RE.match(label)
+        if lm:
+            link_code = lm.group(1).upper()
+            rank = int(lm.group(2))
+            label = None
+        else:
+            rm = RANK_LABEL_RE.match(label)
+            if rm:
+                rank  = int(rm.group(1))
+                label = None  # rank replaces label
     return {
-        "kind":  "single",
-        "codes": [code],
-        "label": label,
-        "rank":  rank,
+        "kind":      "single",
+        "codes":     [code],
+        "label":     label,
+        "rank":      rank,
+        "link_code": link_code,
     }
 
 
@@ -479,6 +491,8 @@ def build_section_data(ws, sections, w4, w5, lw4, lw5):
         rows = section_rows(ws, start, end, w4, w5, lw4, lw5)
         by_label = {normalise(lbl): tri for _, lbl, _, _, _, _, tri in rows if tri}
         pct_by_label = {normalise(lbl): (p4, p5) for _, lbl, _, _, p4, p5, _ in rows}
+        # Precise Wave-5 fraction (e.g. 0.356) for exact chart-value matching.
+        raw_by_label = {normalise(lbl): w5v for _, lbl, _, w5v, _, _, _ in rows}
         ranked_w5 = sorted(
             [(r_, lbl, w4v, w5v, p4, p5, tri) for r_, lbl, w4v, w5v, p4, p5, tri in rows if p5 is not None],
             key=lambda x: x[5],
@@ -486,7 +500,8 @@ def build_section_data(ws, sections, w4, w5, lw4, lw5):
         )
         if code not in result:
             result[code] = {"rows": rows, "by_label": by_label,
-                            "pct_by_label": pct_by_label, "ranked_w5": ranked_w5}
+                            "pct_by_label": pct_by_label,
+                            "raw_by_label": raw_by_label, "ranked_w5": ranked_w5}
         else:
             # Merge unique sig labels (preserves "first wins" while not losing duplicates)
             for k, v in by_label.items():
@@ -495,6 +510,9 @@ def build_section_data(ws, sections, w4, w5, lw4, lw5):
             for k, v in pct_by_label.items():
                 if k not in result[code]["pct_by_label"]:
                     result[code]["pct_by_label"][k] = v
+            for k, v in raw_by_label.items():
+                if k not in result[code]["raw_by_label"]:
+                    result[code]["raw_by_label"][k] = v
     return result
 
 
@@ -564,6 +582,72 @@ def chart_categories(series):
         return result
     except Exception:
         return []
+
+
+def series_values(series):
+    """Return {idx: float_value} from a series' numeric cache (val numRef)."""
+    out = {}
+    try:
+        val_el = series._element.find(f".//{{{C}}}val")
+        if val_el is None:
+            return out
+        cache = val_el.find(f".//{{{C}}}numRef/{{{C}}}numCache")
+        if cache is None:
+            cache = val_el.find(f".//{{{C}}}numCache")
+        if cache is None:
+            return out
+        for p in cache.findall(f"{{{C}}}pt"):
+            v = p.find(f"{{{C}}}v")
+            if v is not None and v.text is not None:
+                try:
+                    out[int(p.get("idx", 0))] = float(v.text)
+                except ValueError:
+                    pass
+    except Exception:
+        pass
+    return out
+
+
+_PCT_IN_TEXT_RE = re.compile(r"(\d+(?:\.\d+)?)\s*%")
+
+def extract_pct_from_text(text):
+    """Return the first percentage integer found in text (rounded), or None."""
+    if not text:
+        return None
+    m = _PCT_IN_TEXT_RE.search(text)
+    if not m:
+        return None
+    try:
+        return round(float(m.group(1)))
+    except ValueError:
+        return None
+
+
+def numbers_match(displayed, expected_p5, tol=1):
+    """
+    True if a displayed percentage matches the expected Wave-5 percentage from
+    the chosen column, within a rounding tolerance (default ±1 point).
+    If we can't read the displayed number, we DO NOT block (return True) — the
+    label/section match already gates those cases.
+    """
+    if displayed is None or expected_p5 is None:
+        return True
+    return abs(int(displayed) - int(expected_p5)) <= tol
+
+
+def chart_value_matches(series_value, raw_w5, tol=0.005):
+    """
+    Precise match for charts: compare the plotted series value (a fraction such
+    as 0.356) against the column's raw Wave-5 fraction, to 2 decimal places of
+    the percentage (tol=0.005 ⇒ within half a tenth of a point).
+    Returns True when we can't read either value (don't block on missing data).
+    """
+    if series_value is None or raw_w5 is None:
+        return True
+    try:
+        return abs(float(series_value) - float(raw_w5)) <= tol
+    except (TypeError, ValueError):
+        return True
 
 
 def find_existing_dlbl(dLbls, idx):
@@ -938,12 +1022,14 @@ def append_triangle_to_table_cell(cell, triangle, white=False):
 def process_chart(shape, spec, section_data):
     """
     Apply triangles to a chart's existing data labels.
-    Returns (updates_count, list_of_log_strings, list_of_item_strings).
+    Returns (updates_count, logs, items, matched) where `matched` counts the
+    chart labels whose text was actually found in the section data.
     """
     chart = shape.chart
     logs  = []
     items = []
     n     = 0
+    matched = 0
     kind  = spec["kind"]
 
     # ── multi_root: xMULTI form ──────────────────────────────────────────────
@@ -986,9 +1072,24 @@ def process_chart(shape, spec, section_data):
                     continue
                 label_map = sec.get("by_label", {})
                 pct_map   = sec.get("pct_by_label", {})
+                raw_map   = sec.get("raw_by_label", {})
+                svals     = series_values(series)
                 for cat_idx, cat_text in cats:
+                    _pct = pct_map.get(normalise(cat_text))
+                    sval = svals.get(cat_idx)
+                    raw  = raw_map.get(normalise(cat_text))
+                    num_ok = chart_value_matches(sval, raw)
+                    if normalise(cat_text) in pct_map and num_ok:
+                        matched += 1
                     tri = label_map.get(normalise(cat_text))
                     if not tri:
+                        continue
+                    if not num_ok:
+                        _shown = f"{sval*100:.2f}" if sval is not None else "?"
+                        _col   = f"{raw*100:.2f}" if raw is not None else "?"
+                        logs.append(
+                            f"chart '{shape.name}' [{ser_code}] cat[{cat_idx}] '{cat_text[:35]}' "
+                            f"SKIP: shown {_shown}% ≠ column {_col}%")
                         continue
                     dLbl = find_existing_dlbl(dLbls, cat_idx)
                     if dLbl is None:
@@ -1001,10 +1102,11 @@ def process_chart(shape, spec, section_data):
                         items.append(f"[{ser_code}] '{cat_text[:40]}' → {tri}"
                                      f"{_pct_suffix(pct_map.get(normalise(cat_text)))}")
                         n += 1
-            return n, logs, items
+            return n, logs, items, matched
 
         # Layout A: category → section, series name → row label
         for series, dLbls, cats, series_name in series_list:
+            svals = series_values(series)
             for cat_idx, cat_text in cats:
                 cm = CAT_CODE_PREFIX_RE.match(cat_text)
                 if not cm:
@@ -1017,8 +1119,21 @@ def process_chart(shape, spec, section_data):
                     continue
                 label_map = sec.get("by_label", {})
                 pct_map   = sec.get("pct_by_label", {})
+                raw_map   = sec.get("raw_by_label", {})
+                sval = svals.get(cat_idx)
+                raw  = raw_map.get(normalise(series_name))
+                num_ok = chart_value_matches(sval, raw)
+                if normalise(series_name) in pct_map and num_ok:
+                    matched += 1
                 tri = label_map.get(normalise(series_name))
                 if not tri:
+                    continue
+                if not num_ok:
+                    _shown = f"{sval*100:.2f}" if sval is not None else "?"
+                    _col   = f"{raw*100:.2f}" if raw is not None else "?"
+                    logs.append(
+                        f"chart '{shape.name}' [{cat_code}] series='{series_name[:22]}' "
+                        f"cat[{cat_idx}] SKIP: shown {_shown}% ≠ column {_col}%")
                     continue
                 dLbl = find_existing_dlbl(dLbls, cat_idx)
                 if dLbl is None:
@@ -1032,7 +1147,7 @@ def process_chart(shape, spec, section_data):
                     items.append(f"[{cat_code}] '{series_name[:25]}' → {tri}"
                                  f"{_pct_suffix(pct_map.get(normalise(series_name)))}")
                     n += 1
-        return n, logs, items
+        return n, logs, items, matched
 
     # Resolve which sections this chart pulls from
     codes = spec["codes"]
@@ -1050,14 +1165,33 @@ def process_chart(shape, spec, section_data):
         sec  = section_data.get(code, {})
         label_map = sec.get("by_label", {})
         pct_map   = sec.get("pct_by_label", {})
+        raw_map   = sec.get("raw_by_label", {})
+        svals     = series_values(series)
 
         # Mode A: the series name matches a row label (e.g. "Very satisfied")
         sname_tri = label_map.get(normalise(series_name))
+        sname_raw = raw_map.get(normalise(series_name))
+        if normalise(series_name) in pct_map:
+            # In Mode A the series value at each category is the displayed number.
+            # Count as matched only if the numbers agree with the chosen column.
+            sname_matched = any(
+                chart_value_matches(svals.get(ci), sname_raw)
+                for ci, _ in cats
+            ) if cats else (normalise(series_name) in pct_map)
+            if sname_matched:
+                matched += 1
         if sname_tri and cats:
-            # Series name = the metric; apply to every category that has an
-            # existing dLbl (we never create new ones).
             series_n = 0
             for cat_idx, cat_text in cats:
+                # Verify the plotted number matches the chosen column's W5 value
+                sval = svals.get(cat_idx)
+                if not chart_value_matches(sval, sname_raw):
+                    _shown = f"{sval*100:.2f}" if sval is not None else "?"
+                    _col   = f"{sname_raw*100:.2f}" if sname_raw is not None else "?"
+                    logs.append(
+                        f"chart '{shape.name}' series='{series_name}' cat[{cat_idx}] "
+                        f"SKIP: shown {_shown}% ≠ column {_col}%")
+                    continue
                 dLbl = find_existing_dlbl(dLbls, cat_idx)
                 if dLbl is None:
                     continue
@@ -1075,14 +1209,30 @@ def process_chart(shape, spec, section_data):
         if cats:
             for cat_idx, cat_text in cats:
                 # Try the raw category text first
-                tri = label_map.get(normalise(cat_text))
-                # If no match, try stripping a leading "<code>. " section prefix
-                # (e.g. "C7_13. Battlegrounds" → "Battlegrounds")
+                _norm = normalise(cat_text)
+                _stripped = CAT_CODE_PREFIX_RE.sub("", cat_text, count=1)
+                _norm_stripped = normalise(_stripped)
+                _pct  = pct_map.get(_norm) or pct_map.get(_norm_stripped)
+                _raw  = raw_map.get(_norm)
+                if _raw is None:
+                    _raw = raw_map.get(_norm_stripped)
+                # The plotted value at this category is the displayed number.
+                sval = svals.get(cat_idx)
+                label_present = _norm in pct_map or _norm_stripped in pct_map
+                num_ok = chart_value_matches(sval, _raw)
+                if label_present and num_ok:
+                    matched += 1
+                tri = label_map.get(_norm)
+                if not tri and _stripped != cat_text:
+                    tri = label_map.get(_norm_stripped)
                 if not tri:
-                    stripped = CAT_CODE_PREFIX_RE.sub("", cat_text, count=1)
-                    if stripped != cat_text:
-                        tri = label_map.get(normalise(stripped))
-                if not tri:
+                    continue
+                if not num_ok:
+                    _shown = f"{sval*100:.2f}" if sval is not None else "?"
+                    _col   = f"{_raw*100:.2f}" if _raw is not None else "?"
+                    logs.append(
+                        f"chart '{shape.name}' cat[{cat_idx}] '{cat_text[:40]}' "
+                        f"SKIP: shown {_shown}% ≠ column {_col}%")
                     continue
                 dLbl = find_existing_dlbl(dLbls, cat_idx)
                 if dLbl is None:
@@ -1090,13 +1240,10 @@ def process_chart(shape, spec, section_data):
                 white = should_force_white(tri, series._element, dLbl, dLbls)
                 if append_triangle_to_dlbl(dLbl, tri, white):
                     logs.append(f"chart '{shape.name}' cat[{cat_idx}] '{cat_text[:45]}' → {tri}")
-                    _norm = normalise(cat_text)
-                    _pct  = pct_map.get(_norm) or pct_map.get(
-                        normalise(CAT_CODE_PREFIX_RE.sub("", cat_text, count=1)))
                     items.append(f"'{cat_text[:45]}' → {tri}{_pct_suffix(_pct)}")
                     n += 1
 
-    return n, logs, items
+    return n, logs, items, matched
 
 
 # ── Table processing ──────────────────────────────────────────────────────────
@@ -1108,6 +1255,9 @@ def process_table(shape, spec, section_data):
     If the table has a dedicated empty trailing column, the triangle is
     written there (preserving the % value). Otherwise the triangle is
     appended to the value cell text rather than replacing it.
+
+    Returns (updates_count, logs, items, matched) where `matched` is the number
+    of table rows whose label was actually found in the section data.
     """
     code = spec["codes"][0]
     sec  = section_data.get(code, {})
@@ -1119,6 +1269,7 @@ def process_table(shape, spec, section_data):
     logs  = []
     items = []
     n     = 0
+    matched = 0
 
     # The triangle is appended directly after the "%" in the value cell.
     # Find the value column: the first column (after col 0) whose cells
@@ -1133,22 +1284,32 @@ def process_table(shape, spec, section_data):
         row_label = table.cell(r, 0).text.strip()
         if not row_label:
             continue
-        tri = label_map.get(normalise(row_label))
+        norm = normalise(row_label)
+        stripped = CAT_CODE_PREFIX_RE.sub("", row_label, count=1)
+        norm_stripped = normalise(stripped)
+        _pct = pct_map.get(norm) or pct_map.get(norm_stripped)
+        # Read the % shown in the table's value cell and compare to the column.
+        disp = extract_pct_from_text(table.cell(r, value_col).text)
+        num_ok = numbers_match(disp, _pct[1] if _pct else None)
+        label_present = norm in pct_map or norm_stripped in pct_map
+        if label_present and num_ok:
+            matched += 1
+        tri = label_map.get(norm)
+        if not tri and stripped != row_label:
+            tri = label_map.get(norm_stripped)
         if not tri:
-            # Try stripping a section-code prefix
-            stripped = CAT_CODE_PREFIX_RE.sub("", row_label, count=1)
-            if stripped != row_label:
-                tri = label_map.get(normalise(stripped))
-        if not tri:
+            continue
+        if not num_ok:
+            logs.append(
+                f"table '{shape.name}' row {r} '{row_label[:35]}' "
+                f"SKIP: shown {disp}% ≠ column {_pct[1] if _pct else '?'}%")
             continue
         # Append the triangle right after the % in the value cell
         append_triangle_to_table_cell(table.cell(r, value_col), tri)
         logs.append(f"table '{shape.name}' row {r} '{row_label[:40]}' → {tri}")
-        _pct = pct_map.get(normalise(row_label)) or pct_map.get(
-            normalise(CAT_CODE_PREFIX_RE.sub("", row_label, count=1)))
         items.append(f"'{row_label[:40]}' → {tri}{_pct_suffix(_pct)}")
         n += 1
-    return n, logs, items
+    return n, logs, items, matched
 
 
 # ── Shape dispatcher ──────────────────────────────────────────────────────────
@@ -1213,10 +1374,15 @@ def process_shape(slide_num, slide, shape, spec, section_data, cut, report_rows)
 
     # ── Chart ────────────────────────────────────────────────────────────────
     if shape.has_chart:
-        n, logs, items = process_chart(shape, spec, section_data)
+        n, logs, items, matched = process_chart(shape, spec, section_data)
         for l in logs:
             print(f"    {l}")
-        if n > 0:
+        if matched == 0:
+            report_rows.append({**base, "status": STATUS_MISSING,
+                                "items_applied": "no chart labels matched the section data",
+                                "triangles_added": 0})
+            print(f"  [DATA NOT FOUND] '{shape.name}': no labels matched section data")
+        elif n > 0:
             report_rows.append({**base, "status": STATUS_OK,
                                 "items_applied": "\n".join(items), "triangles_added": n})
         else:
@@ -1229,10 +1395,15 @@ def process_shape(slide_num, slide, shape, spec, section_data, cut, report_rows)
         # Skip 1-row legend tables
         if len(shape.table.rows) <= 1:
             return 0
-        n, logs, items = process_table(shape, spec, section_data)
+        n, logs, items, matched = process_table(shape, spec, section_data)
         for l in logs:
             print(f"    {l}")
-        if n > 0:
+        if matched == 0:
+            report_rows.append({**base, "status": STATUS_MISSING,
+                                "items_applied": "no table rows matched the section data",
+                                "triangles_added": 0})
+            print(f"  [DATA NOT FOUND] '{shape.name}': no rows matched section data")
+        elif n > 0:
             report_rows.append({**base, "status": STATUS_OK,
                                 "items_applied": "\n".join(items), "triangles_added": n})
         else:
@@ -1244,10 +1415,60 @@ def process_shape(slide_num, slide, shape, spec, section_data, cut, report_rows)
     if shape.has_text_frame:
         code = spec["codes"][0]
         sec  = section_data.get(code, {})
+        shown_pct = extract_pct_from_text(shape.text_frame.text)
 
         # Rank lookup mode
         if spec.get("rank") is not None:
             rank = spec["rank"]
+            link_code = spec.get("link_code")
+
+            if link_code:
+                # The rank order follows the linked section's W5 sort, but the
+                # value/triangle come from THIS shape's own section, matched by
+                # the row label at the linked section's rank position.
+                link_sec = section_data.get(link_code)
+                if link_sec is None:
+                    report_rows.append({**base, "status": STATUS_MISSING,
+                                        "items_applied": f"LINK section {link_code} not found",
+                                        "triangles_added": 0})
+                    print(f"  '{shape.name}' → DATA NOT FOUND (LINK section {link_code} missing)")
+                    return 0
+                link_ranked = link_sec.get("ranked_w5", [])
+                if rank < 1 or rank > len(link_ranked):
+                    report_rows.append({**base, "status": STATUS_WARN, "items_applied": "",
+                                        "triangles_added": 0})
+                    print(f"  '{shape.name}' → LINK rank {rank} out of range")
+                    return 0
+                link_label = link_ranked[rank - 1][1]   # label at linked rank N
+                norm = normalise(link_label)
+                by_label = sec.get("by_label", {})
+                pct_map  = sec.get("pct_by_label", {})
+                if norm not in pct_map:
+                    report_rows.append({**base, "status": STATUS_MISSING,
+                                        "items_applied": f"linked label '{link_label[:40]}' not in section {code}",
+                                        "triangles_added": 0})
+                    print(f"  '{shape.name}' → DATA NOT FOUND (linked '{link_label[:30]}' not in {code})")
+                    return 0
+                p4, p5 = pct_map.get(norm)
+                if not numbers_match(shown_pct, p5):
+                    print(f"  '{shape.name}' → DATA NOT FOUND (shown {shown_pct}% ≠ column {p5}%)")
+                    report_rows.append({**base, "status": STATUS_MISSING,
+                                        "items_applied": f"shown {shown_pct}% ≠ column W5 {p5}% (LINK {link_code} rank {rank})",
+                                        "triangles_added": 0})
+                    return 0
+                tri = by_label.get(norm)
+                if tri:
+                    write_triangle_to_textbox(shape, tri)
+                    print(f"  '{shape.name}' [{col_label}] LINK {link_code} rank{rank} '{link_label[:35]}' → {tri}")
+                    report_rows.append({**base, "status": STATUS_OK,
+                                        "items_applied": f"LINK {link_code} rank {rank} '{link_label[:35]}' → {tri}{_pct_suffix((p4, p5))}",
+                                        "triangles_added": 1})
+                    return 1
+                print(f"  '{shape.name}' → LINK {link_code} rank {rank} ('{link_label[:30]}') no sig")
+                report_rows.append({**base, "status": STATUS_NO_SIG, "items_applied": "",
+                                    "triangles_added": 0})
+                return 0
+
             ranked = sec.get("ranked_w5", [])
             if rank < 1 or rank > len(ranked):
                 report_rows.append({**base, "status": STATUS_WARN, "items_applied": "",
@@ -1255,6 +1476,14 @@ def process_shape(slide_num, slide, shape, spec, section_data, cut, report_rows)
                 print(f"  '{shape.name}' → rank {rank} out of range")
                 return 0
             _, lbl, _, _, p4, p5, tri = ranked[rank - 1]
+            # The textbox's number must match the ranked row's W5 value for this
+            # column; otherwise the textbox is showing a different column's data.
+            if not numbers_match(shown_pct, p5):
+                print(f"  '{shape.name}' → DATA NOT FOUND (shown {shown_pct}% ≠ column {p5}%)")
+                report_rows.append({**base, "status": STATUS_MISSING,
+                                    "items_applied": f"shown {shown_pct}% ≠ column W5 {p5}% (rank {rank})",
+                                    "triangles_added": 0})
+                return 0
             if tri:
                 write_triangle_to_textbox(shape, tri)
                 print(f"  '{shape.name}' [{col_label}] rank{rank} '{lbl[:40]}' → {tri}")
@@ -1273,11 +1502,31 @@ def process_shape(slide_num, slide, shape, spec, section_data, cut, report_rows)
             report_rows.append({**base, "status": STATUS_WARN, "items_applied": "",
                                 "triangles_added": 0})
             return 0
-        tri = sec.get("by_label", {}).get(normalise(label))
+        norm = normalise(label)
+        by_label = sec.get("by_label", {})
+        pct_map  = sec.get("pct_by_label", {})
+        _pct = pct_map.get(norm)
+
+        # If the label isn't in the section at all → data not found.
+        if norm not in pct_map:
+            print(f"  '{shape.name}' → DATA NOT FOUND (label '{label[:40]}' not in section {code})")
+            report_rows.append({**base, "status": STATUS_MISSING,
+                                "items_applied": f"label '{label[:60]}' not found in section {code}",
+                                "triangles_added": 0})
+            return 0
+
+        # The number shown in the textbox must match the chosen column's W5 value.
+        if not numbers_match(shown_pct, _pct[1] if _pct else None):
+            print(f"  '{shape.name}' → DATA NOT FOUND (shown {shown_pct}% ≠ column {_pct[1]}%)")
+            report_rows.append({**base, "status": STATUS_MISSING,
+                                "items_applied": f"shown {shown_pct}% ≠ column W5 {_pct[1]}%",
+                                "triangles_added": 0})
+            return 0
+
+        tri = by_label.get(norm)
         if tri:
             write_triangle_to_textbox(shape, tri)
             print(f"  '{shape.name}' [{col_label}] → {tri}")
-            _pct = sec.get("pct_by_label", {}).get(normalise(label))
             report_rows.append({**base, "status": STATUS_OK,
                                 "items_applied": f"'{label}' → {tri}{_pct_suffix(_pct)}",
                                 "triangles_added": 1})
@@ -1433,11 +1682,31 @@ def run_sync(excel_bytes, pptx_bytes, log=print):
         if slide_num != current_slide:
             log(f"--- Slide {slide_num} ---")
             current_slide = slide_num
-        spec = parse_shape_name(shape.name)
-        section_data = data_by_col[cut]
-        n = process_shape(slide_num, slide_lookup[slide_num], shape, spec,
-                          section_data, cut, report_rows)
-        total += n
+        try:
+            spec = parse_shape_name(shape.name)
+            section_data = data_by_col.get(cut)
+            if section_data is None:
+                # The cut couldn't be resolved to data; treat as data-not-found.
+                report_rows.append({
+                    "slide": slide_num, "shape_name": shape.name,
+                    "status": STATUS_MISSING,
+                    "items_applied": f"column cut {' > '.join(cut) if cut else '(default)'} not found in data",
+                    "triangles_added": 0,
+                })
+                log(f"  [DATA NOT FOUND] '{shape.name}': cut not resolved")
+                continue
+            n = process_shape(slide_num, slide_lookup[slide_num], shape, spec,
+                              section_data, cut, report_rows)
+            total += n
+        except Exception as exc:
+            # One problematic shape must not abort the whole deck.
+            report_rows.append({
+                "slide": slide_num, "shape_name": shape.name,
+                "status": STATUS_WARN,
+                "items_applied": f"error: {exc}",
+                "triangles_added": 0,
+            })
+            log(f"  [ERROR] '{shape.name}': {exc}")
 
     # ── Serialise outputs to bytes ──────────────────────────────────────────────
     ppt_buf = io.BytesIO()
