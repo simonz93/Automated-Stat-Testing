@@ -378,58 +378,6 @@ def find_wave_row(ws):
     return None
 
 
-def scan_header_values(ws):
-    """
-    Inspect the column-header hierarchy above each Wave 4/Wave 5 column and
-    return the distinct values that appear at each level.
-
-    Returns a dict:
-      {
-        "regions":   [sorted list of level-1/level-2 group labels],
-        "sub_cols":  [sorted list of the labels sitting directly above the
-                      wave row, i.e. the sub-column level],
-        "sheets":    handled by the caller,
-      }
-    'regions' and 'sub_cols' are deliberately generous supersets so the UI can
-    offer every label that could legitimately be typed into find_wave_columns.
-    """
-    wave_row = find_wave_row(ws)
-    if wave_row is None:
-        return {"regions": [], "sub_cols": []}
-
-    # The sub-column level is the header row immediately above the wave row.
-    # Everything above that contributes "region"/group candidates.
-    rows_above = [r for r in HEADER_ROWS if r < wave_row]
-    sub_row = max(rows_above) if rows_above else None
-    upper_rows = [r for r in rows_above if r != sub_row]
-
-    sub_vals = set()
-    region_vals = set()
-
-    # Walk the wave columns and collect the ancestry value at each level.
-    for col in range(2, ws.max_column + 1):
-        v = ws.cell(row=wave_row, column=col).value
-        if not v or str(v).strip() not in ("Wave 4", "Wave 5"):
-            continue
-        # Sub-column: nearest non-empty cell at sub_row scanning leftward
-        if sub_row is not None:
-            for c in range(col, 0, -1):
-                cell = ws.cell(row=sub_row, column=c).value
-                if cell is not None:
-                    sub_vals.add(str(cell).strip())
-                    break
-        # Region/group levels: nearest non-empty at each upper row
-        for hr in upper_rows:
-            for c in range(col, 0, -1):
-                cell = ws.cell(row=hr, column=c).value
-                if cell is not None:
-                    region_vals.add(str(cell).strip())
-                    break
-
-    drop_blank = lambda s: [x for x in sorted(s) if x]
-    return {"regions": drop_blank(region_vals), "sub_cols": drop_blank(sub_vals)}
-
-
 # ── Excel section scanning ────────────────────────────────────────────────────
 
 SECTION_CODE_RE = re.compile(r"^([A-Za-z][\w]*)\.\s*(.*)", re.IGNORECASE)
@@ -489,12 +437,15 @@ def build_section_data(ws, sections, w4, w5, lw4, lw5):
     for i, (code, start, _) in enumerate(sections):
         end = sections[i + 1][1] if i + 1 < len(sections) else None
         rows = section_rows(ws, start, end, w4, w5, lw4, lw5)
-        by_label = {normalise(lbl): tri for _, lbl, _, _, _, _, tri in rows if tri}
-        pct_by_label = {normalise(lbl): (p4, p5) for _, lbl, _, _, p4, p5, _ in rows}
-        # Precise Wave-5 fraction (e.g. 0.356) for exact chart-value matching.
-        raw_by_label = {normalise(lbl): w5v for _, lbl, _, w5v, _, _, _ in rows}
+        by_label, pct_by_label, raw_by_label = {}, {}, {}
+        for _, lbl, _w4v, w5v, p4, p5, tri in rows:
+            nlbl = normalise(lbl)
+            if tri:
+                by_label.setdefault(nlbl, tri)
+            pct_by_label.setdefault(nlbl, (p4, p5))
+            raw_by_label.setdefault(nlbl, w5v)
         ranked_w5 = sorted(
-            [(r_, lbl, w4v, w5v, p4, p5, tri) for r_, lbl, w4v, w5v, p4, p5, tri in rows if p5 is not None],
+            (r for r in rows if r[5] is not None),
             key=lambda x: x[5],
             reverse=True,
         )
@@ -503,16 +454,13 @@ def build_section_data(ws, sections, w4, w5, lw4, lw5):
                             "pct_by_label": pct_by_label,
                             "raw_by_label": raw_by_label, "ranked_w5": ranked_w5}
         else:
-            # Merge unique sig labels (preserves "first wins" while not losing duplicates)
+            # Merge unique labels (preserves "first wins" while not losing dups)
             for k, v in by_label.items():
-                if k not in result[code]["by_label"]:
-                    result[code]["by_label"][k] = v
+                result[code]["by_label"].setdefault(k, v)
             for k, v in pct_by_label.items():
-                if k not in result[code]["pct_by_label"]:
-                    result[code]["pct_by_label"][k] = v
+                result[code]["pct_by_label"].setdefault(k, v)
             for k, v in raw_by_label.items():
-                if k not in result[code]["raw_by_label"]:
-                    result[code]["raw_by_label"][k] = v
+                result[code]["raw_by_label"].setdefault(k, v)
     return result
 
 
@@ -1315,7 +1263,7 @@ def process_table(shape, spec, section_data):
 # ── Shape dispatcher ──────────────────────────────────────────────────────────
 
 STATUS_OK      = "Data found – stat testing applied"
-STATUS_NO_SIG  = "Data found – no stat testing"
+STATUS_NO_SIG  = "Data found – not significant"
 STATUS_WARN    = "Data not found"
 STATUS_MISSING = "Data not found"
 
@@ -1574,10 +1522,14 @@ def build_report(report_rows):
 
     H_FILL = PatternFill("solid", start_color="1F4E79")
     H_FONT = Font(color="FFFFFF", bold=True, name="Arial", size=10)
+    GREEN_FILL = PatternFill("solid", start_color="E2EFDA")   # stat testing applied
+    GREY_FILL  = PatternFill("solid", start_color="EDEDED")   # not significant
+    RED_FILL   = PatternFill("solid", start_color="F8CBAD")   # data not found
     FILLS  = {
-        STATUS_OK:      PatternFill("solid", start_color="E2EFDA"),
-        STATUS_NO_SIG:  PatternFill("solid", start_color="EDEDED"),
-        STATUS_WARN:    PatternFill("solid", start_color="FCE4D6"),
+        STATUS_OK:      GREEN_FILL,
+        STATUS_NO_SIG:  GREY_FILL,
+        STATUS_WARN:    RED_FILL,
+        STATUS_MISSING: RED_FILL,
     }
     C_FONT = Font(name="Arial", size=10)
     THIN   = Side(style="thin", color="BFBFBF")
@@ -1635,7 +1587,7 @@ def build_report(report_rows):
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
-def run_sync(excel_bytes, pptx_bytes, log=print):
+def run_sync(excel_bytes, pptx_bytes, log=print, worksheet=None):
     """
     Core entry point. Takes Excel + PPTX as raw bytes, applies triangles,
     and returns a dict:
@@ -1646,18 +1598,25 @@ def run_sync(excel_bytes, pptx_bytes, log=print):
         "report_rows":  list of per-shape result dicts,
       }
     `log` is a callable used for progress messages (defaults to print).
+    `worksheet` lets a caller pass an already-loaded openpyxl worksheet for the
+    target sheet, avoiding a second (slow) workbook load. When omitted, the
+    workbook is loaded from `excel_bytes` as before.
     """
     import io
 
-    # ── Load Excel ────────────────────────────────────────────────────────────
-    wb = openpyxl.load_workbook(io.BytesIO(excel_bytes), data_only=True)
-    if EXCEL_SHEET not in wb.sheetnames:
-        raise ValueError(
-            f"Sheet '{EXCEL_SHEET}' not found in the data file. "
-            f"Available sheets: {wb.sheetnames}"
-        )
-    ws = wb[EXCEL_SHEET]
-    log(f"Loaded Excel — sheet '{EXCEL_SHEET}'.")
+    # ── Load Excel (reuse a pre-loaded worksheet when provided) ───────────────
+    if worksheet is not None:
+        ws = worksheet
+        log(f"Using pre-loaded sheet '{EXCEL_SHEET}'.")
+    else:
+        wb = openpyxl.load_workbook(io.BytesIO(excel_bytes), data_only=True)
+        if EXCEL_SHEET not in wb.sheetnames:
+            raise ValueError(
+                f"Sheet '{EXCEL_SHEET}' not found in the data file. "
+                f"Available sheets: {wb.sheetnames}"
+            )
+        ws = wb[EXCEL_SHEET]
+        log(f"Loaded Excel — sheet '{EXCEL_SHEET}'.")
 
     # Reset per-run caches that depend on the specific workbook/deck
     get_col_ancestry.__defaults__[0].clear()  # the _cache dict
