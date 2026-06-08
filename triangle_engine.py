@@ -446,7 +446,7 @@ def build_section_data(ws, sections, w4, w5, lw4, lw5):
             raw_by_label.setdefault(nlbl, w5v)
         ranked_w5 = sorted(
             (r for r in rows if r[5] is not None),
-            key=lambda x: x[5],
+            key=lambda x: (x[3] if x[3] is not None else x[5] / 100.0),
             reverse=True,
         )
         if code not in result:
