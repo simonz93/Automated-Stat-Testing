@@ -33,12 +33,16 @@ st.set_page_config(page_title="Significance Triangle Sync", page_icon="▲", lay
 # (e.g. a stale copy elsewhere on the path) the run would fail deep inside with a
 # confusing error. Detect that up front and say exactly which file was loaded.
 _engine_path = getattr(engine, "__file__", "(unknown)")
+REQUIRED_ENGINE_API = 5
+_engine_api = getattr(engine, "ENGINE_API_VERSION", 0)
 _run_sync_params = inspect.signature(engine.run_sync).parameters
-if "worksheet" not in _run_sync_params:
+if _engine_api < REQUIRED_ENGINE_API or "worksheet" not in _run_sync_params:
     st.error(
         "The triangle_engine.py being loaded is an OLD version that doesn't match "
         "this app.py.\n\n"
         f"Python loaded the engine from:\n`{_engine_path}`\n\n"
+        f"That file reports engine version {_engine_api}; this app needs "
+        f"version {REQUIRED_ENGINE_API}.\n\n"
         "Replace that file with the matching triangle_engine.py (the one delivered "
         "alongside this app.py), delete any `__pycache__` folder next to it, and "
         "restart. Both files must come from the same release."
@@ -65,7 +69,8 @@ if st.session_state.get("show_help"):
     with st.expander("How to use this app", expanded=True):
         st.markdown(
             """
-**What it does** — reads a survey cross-tab Excel, compares Wave 4 vs Wave 5 for
+**What it does** — reads a survey cross-tab Excel, compares your chosen
+current column against the benchmark column (e.g. Wave 5 vs Wave 4) for
 the column cut you choose, and writes ▲ (significant increase) / ▼ (significant
 decrease) markers into the matching shapes of your PowerPoint deck.
 
@@ -73,9 +78,10 @@ decrease) markers into the matching shapes of your PowerPoint deck.
 
 1. **Upload the data Excel and the PowerPoint** at the top. To swap a file,
    upload a different one in the same box.
-2. **Step 1 · Excel layout** — pick the data sheet and confirm where the header
-   rows, letter row, and label column live, then press **Continue → scan this
-   sheet**. Only the sheet you choose is scanned, which keeps it fast. If you
+2. **Step 1 · Excel layout** — pick the data sheet, confirm where the header
+   rows, letter row, and label column live, and set the **current** and
+   **benchmark** column labels (e.g. "Wave 5" vs "Wave 4"). These must match the
+   Excel's wave-label row exactly. Then press **Continue → scan this sheet**. Only the sheet you choose is scanned, which keeps it fast. If you
    change any layout field, press Continue again to re-scan.
 3. **Step 2 · Default column cut** — choose the column the tool reads for every
    shape. Each level unlocks the next (e.g. Country → Rest of the world → — →
@@ -90,13 +96,13 @@ decrease) markers into the matching shapes of your PowerPoint deck.
 
 **Reading the report** — each shape is one of:
 - 🟩 **Data found – stat testing applied** — a ▲/▼ was written.
-- ⬜ **Data found – not significant** — matched the data, but the Wave 4↔5 gap
+- ⬜ **Data found – not significant** — matched the data, but the current↔benchmark gap
   was below your threshold, so no marker.
 - 🟥 **Data not found** — the shape's label/number didn't match the chosen
   column, so nothing was written (check the shape name or column cut).
 
 **Validation** — a marker is only applied when the number shown in the shape
-matches the chosen column's Wave 5 value (charts are checked to 2 decimals).
+matches the chosen column's current-wave value (charts are checked to 2 decimals).
 This prevents markers landing on shapes that are actually showing a different
 column.
             """
@@ -138,14 +144,14 @@ column 1 of the Excel (e.g. `B2`, `D6_1`, `C3_1`).
 
         st.markdown("**3 · Rank text boxes** — `x CODE_n. <rank>`")
         st.code(
-            "x D6_1. 1     ← the #1 row when CODE's Wave 5 values are sorted high→low\n"
+            "x D6_1. 1     ← the #1 row when CODE's current-column values are sorted high→low\n"
             "x D6_1. 2\n"
             "x D6_1. 3",
             language=None,
         )
         st.caption(
             "Use when a row of text boxes shows the top-N items by value. Rank 1 "
-            "is the highest Wave 5 value in that section, rank 2 the next, etc."
+            "is the highest current-column value in that section, rank 2 the next, etc."
         )
 
         st.markdown("**4 · LINK text boxes** — `x CODE_n. LINK OTHER. <rank>`")
@@ -215,11 +221,13 @@ def load_worksheet(file_bytes_hash, _file_bytes, sheet):
 
 @st.cache_data(show_spinner=False)
 def build_tree(file_bytes_hash, _ws_key, header_rows, letter_row, label_col,
-               _ws):
+               current_label, benchmark_label, _ws):
     """Build the header tree from an already-loaded worksheet under the layout."""
-    engine.HEADER_ROWS = list(header_rows)
-    engine.LETTER_ROW  = int(letter_row)
-    engine.LABEL_COL   = int(label_col)
+    engine.HEADER_ROWS     = list(header_rows)
+    engine.LETTER_ROW      = int(letter_row)
+    engine.LABEL_COL       = int(label_col)
+    engine.CURRENT_LABEL   = current_label
+    engine.BENCHMARK_LABEL = benchmark_label
     engine.get_col_ancestry.__defaults__[0].clear()
     return engine.build_header_tree(_ws)
 
@@ -246,6 +254,19 @@ def cascade_options(paths, chosen):
     return out
 
 
+def level_options(paths, chosen, lvl, levels):
+    """
+    Valid options for `lvl`, given the choices so far. The deepest level always
+    offers a blank ("not specified") choice, so a cut can stop short of the last
+    level the way it can at an intermediate blank level. A blank here means the
+    level is simply not used to narrow the column match.
+    """
+    opts = cascade_options(paths, chosen)
+    if opts and lvl == levels - 1 and "" not in opts:
+        opts = opts + [""]
+    return opts
+
+
 def cascade_picker(paths, levels, key_prefix, defaults=None):
     """
     Render `levels` cascading selectboxes. Each becomes active only once the
@@ -256,7 +277,7 @@ def cascade_picker(paths, levels, key_prefix, defaults=None):
     chosen = []
     defaults = defaults or []
     for lvl in range(levels):
-        opts = cascade_options(paths, chosen)
+        opts = level_options(paths, chosen, lvl, levels)
         if not opts:
             break
         display = [BLANK if o == "" else o for o in opts]
@@ -361,11 +382,36 @@ def _safe_int(raw, default):
 letter_row = _safe_int(letter_row_raw, engine.LETTER_ROW)
 label_col  = _safe_int(label_col_raw, engine.LABEL_COL)
 
+# Which two columns are being compared. These must match the wave-label row of
+# the Excel exactly (e.g. "Wave 5" vs "Wave 4", or "2026" vs "2025").
+wl1, wl2 = st.columns(2)
+with wl1:
+    current_label = st.text_input(
+        "Current column", value=engine.CURRENT_LABEL,
+        help="The wave/period being reported on — the numbers shown on the "
+             "slides. Must match the label in the Excel exactly.").strip()
+with wl2:
+    benchmark_label = st.text_input(
+        "Benchmark column", value=engine.BENCHMARK_LABEL,
+        help="The wave/period it is compared against. A triangle is applied "
+             "when the current column differs significantly from this one."
+    ).strip()
+
+if not current_label or not benchmark_label:
+    st.error("Both the current and benchmark column labels are required.")
+    st.stop()
+if current_label == benchmark_label:
+    st.error("The current and benchmark columns must be different labels.")
+    st.stop()
+st.caption(f"Comparing **{current_label}** (current) against "
+           f"**{benchmark_label}** (benchmark) — ▲/▼ mark significant "
+           f"differences in {current_label}.")
+
 with st.expander("What the layout means"):
     st.code(
         "Row 1-4  : Hierarchical column headers (Country/Market -> Region -> Group -> Sub-col)\n"
         "Row 5    : 'Wave' label row\n"
-        "Row 6    : 'Wave 4' / 'Wave 5' labels\n"
+        "Row 6    : current / benchmark column labels (e.g. 'Wave 5' / 'Wave 4')\n"
         "Row 7    : Letter codes (A, B, C, D ...)\n"
         "Row 8+   : Data, sig row immediately below each value row\n"
         "Column 1 : Section headers & row labels",
@@ -379,7 +425,8 @@ if not header_rows:
 
 # Staging: only scan the sheet after the user presses Continue (item 1).
 # If any layout input changes, invalidate the previous scan so it re-runs.
-layout_sig = (sheet, tuple(header_rows), letter_row, label_col)
+layout_sig = (sheet, tuple(header_rows), letter_row, label_col,
+              current_label, benchmark_label)
 if st.session_state.get("layout_sig") != layout_sig:
     st.session_state.pop("layout_ready", None)
 
@@ -399,7 +446,8 @@ try:
         _xl_hash = hash(excel_bytes)
         ws_loaded = load_worksheet(_xl_hash, excel_bytes, sheet)
         tree = build_tree(_xl_hash, (sheet, _xl_hash), tuple(header_rows),
-                          int(letter_row), int(label_col), ws_loaded)
+                          int(letter_row), int(label_col),
+                          current_label, benchmark_label, ws_loaded)
 except Exception as exc:
     _top_bar(False)
     st.error(f"Couldn't read the header hierarchy with these layout settings: {exc}")
@@ -411,8 +459,9 @@ paths  = [p for (p, _col) in paths_raw]   # bare path tuples for cascading
 levels = tree["levels"]
 if not paths:
     st.error(
-        "No Wave 4 / Wave 5 columns were found with these layout settings. "
-        "Check the header rows and sheet."
+        f"No '{current_label}' / '{benchmark_label}' columns were found with "
+        "these layout settings. Check that those labels match the Excel exactly, "
+        "and check the header rows and sheet."
     )
     st.stop()
 
@@ -430,7 +479,7 @@ BLANK = "—"
 chosen_default = []
 cols = st.columns(levels)
 for lvl in range(levels):
-    opts = cascade_options(paths, chosen_default)
+    opts = level_options(paths, chosen_default, lvl, levels)
     if not opts:
         # No further levels apply for this branch — show a disabled placeholder
         with cols[lvl]:
@@ -449,6 +498,23 @@ for lvl in range(levels):
     chosen_default.append("" if sel == BLANK else sel)
 
 st.caption("Selected cut → " + " > ".join(c if c else "—" for c in chosen_default))
+
+# Show which Excel columns this cut actually resolves to. A blank level simply
+# isn't used to narrow the match, so it's worth confirming the result.
+try:
+    _b, _c = engine.wave_labels()
+    _w4, _w5, _l4, _l5 = engine.find_wave_columns(
+        ws_loaded, [c for c in chosen_default if c])
+    st.caption(
+        f"Resolves to → **{_b}** = column {_w4} ({_l4})  ·  "
+        f"**{_c}** = column {_w5} ({_l5})")
+    if not all(chosen_default):
+        st.caption(
+            "One or more levels are blank, so they aren't used to narrow the "
+            "match. If several columns fit, the first one is used — check the "
+            "columns above are the ones you want.")
+except Exception as _exc:
+    st.warning(f"This combination doesn't resolve to a column pair: {_exc}")
 
 cset1, cset2 = st.columns(2)
 with cset1:
@@ -565,6 +631,8 @@ if run and pptx_file is not None:
     engine.MIN_DIFF_PCT    = int(min_diff)
     engine.SKIP_SLIDES     = parse_int_list(skip_slides_raw)
     engine.HEADER_ROWS     = header_rows
+    engine.CURRENT_LABEL   = current_label
+    engine.BENCHMARK_LABEL = benchmark_label
     engine.LETTER_ROW      = int(letter_row)
     engine.LABEL_COL       = int(label_col)
     engine.DEFAULT_CUT     = [c for c in chosen_default]
