@@ -33,7 +33,7 @@ st.set_page_config(page_title="Significance Triangle Sync", page_icon="▲", lay
 # (e.g. a stale copy elsewhere on the path) the run would fail deep inside with a
 # confusing error. Detect that up front and say exactly which file was loaded.
 _engine_path = getattr(engine, "__file__", "(unknown)")
-REQUIRED_ENGINE_API = 5
+REQUIRED_ENGINE_API = 6
 _engine_api = getattr(engine, "ENGINE_API_VERSION", 0)
 _run_sync_params = inspect.signature(engine.run_sync).parameters
 if _engine_api < REQUIRED_ENGINE_API or "worksheet" not in _run_sync_params:
@@ -80,12 +80,14 @@ decrease) markers into the matching shapes of your PowerPoint deck.
    upload a different one in the same box.
 2. **Step 1 · Excel layout** — pick the data sheet, confirm where the header
    rows, letter row, and label column live, and set the **current** and
-   **benchmark** column labels (e.g. "Wave 5" vs "Wave 4"). These must match the
-   Excel's wave-label row exactly. Then press **Continue → scan this sheet**. Only the sheet you choose is scanned, which keeps it fast. If you
-   change any layout field, press Continue again to re-scan.
-3. **Step 2 · Default column cut** — choose the column the tool reads for every
-   shape. Each level unlocks the next (e.g. Country → Rest of the world → — →
-   Total). Set the minimum % point difference and any slides to skip here too.
+   label column live, then press **Continue → scan this sheet**. Only the sheet
+   you choose is scanned, which keeps it fast. If you change any layout field,
+   press Continue again to re-scan.
+3. **Step 2 · Columns to compare** — pick the **current** and **benchmark**
+   columns (e.g. Wave 5 vs Wave 4) from the dropdowns, then choose the column
+   cut the tool reads for every shape. Each level unlocks the next (e.g.
+   Country → Rest of the world → — → Total). Set the minimum % point difference
+   and any slides to skip here too.
 4. **Step 3 · Shape overrides (optional)** — for shapes that should read a
    *different* column than the default, add a row: slide number, the exact shape
    name, and the column path.
@@ -219,16 +221,30 @@ def load_worksheet(file_bytes_hash, _file_bytes, sheet):
     return wb[sheet]
 
 
-@st.cache_data(show_spinner=False)
-def build_tree(file_bytes_hash, _ws_key, header_rows, letter_row, label_col,
-               current_label, benchmark_label, _ws):
-    """Build the header tree from an already-loaded worksheet under the layout."""
+def apply_engine_layout(header_rows, letter_row, label_col,
+                        current_label, benchmark_label, wave_row):
+    """
+    Push the chosen layout onto the engine's module-level settings.
+
+    This must be called on EVERY rerun, not from inside a cached function: when
+    st.cache_data returns a cached value its body never executes, which would
+    leave the engine holding settings from an earlier configuration.
+    """
     engine.HEADER_ROWS     = list(header_rows)
     engine.LETTER_ROW      = int(letter_row)
     engine.LABEL_COL       = int(label_col)
     engine.CURRENT_LABEL   = current_label
     engine.BENCHMARK_LABEL = benchmark_label
+    engine.WAVE_ROW        = int(wave_row)
     engine.get_col_ancestry.__defaults__[0].clear()
+
+
+@st.cache_data(show_spinner=False)
+def build_tree(file_bytes_hash, _ws_key, header_rows, letter_row, label_col,
+               current_label, benchmark_label, wave_row, _ws):
+    """Build the header tree from an already-loaded worksheet under the layout."""
+    apply_engine_layout(header_rows, letter_row, label_col,
+                        current_label, benchmark_label, wave_row)
     return engine.build_header_tree(_ws)
 
 
@@ -382,31 +398,6 @@ def _safe_int(raw, default):
 letter_row = _safe_int(letter_row_raw, engine.LETTER_ROW)
 label_col  = _safe_int(label_col_raw, engine.LABEL_COL)
 
-# Which two columns are being compared. These must match the wave-label row of
-# the Excel exactly (e.g. "Wave 5" vs "Wave 4", or "2026" vs "2025").
-wl1, wl2 = st.columns(2)
-with wl1:
-    current_label = st.text_input(
-        "Current column", value=engine.CURRENT_LABEL,
-        help="The wave/period being reported on — the numbers shown on the "
-             "slides. Must match the label in the Excel exactly.").strip()
-with wl2:
-    benchmark_label = st.text_input(
-        "Benchmark column", value=engine.BENCHMARK_LABEL,
-        help="The wave/period it is compared against. A triangle is applied "
-             "when the current column differs significantly from this one."
-    ).strip()
-
-if not current_label or not benchmark_label:
-    st.error("Both the current and benchmark column labels are required.")
-    st.stop()
-if current_label == benchmark_label:
-    st.error("The current and benchmark columns must be different labels.")
-    st.stop()
-st.caption(f"Comparing **{current_label}** (current) against "
-           f"**{benchmark_label}** (benchmark) — ▲/▼ mark significant "
-           f"differences in {current_label}.")
-
 with st.expander("What the layout means"):
     st.code(
         "Row 1-4  : Hierarchical column headers (Country/Market -> Region -> Group -> Sub-col)\n"
@@ -425,8 +416,7 @@ if not header_rows:
 
 # Staging: only scan the sheet after the user presses Continue (item 1).
 # If any layout input changes, invalidate the previous scan so it re-runs.
-layout_sig = (sheet, tuple(header_rows), letter_row, label_col,
-              current_label, benchmark_label)
+layout_sig = (sheet, tuple(header_rows), letter_row, label_col)
 if st.session_state.get("layout_sig") != layout_sig:
     st.session_state.pop("layout_ready", None)
 
@@ -438,42 +428,133 @@ if not st.session_state.get("layout_ready"):
     st.info("Set the layout above, then press Continue to scan the selected sheet.")
     st.stop()
 
-# Build the hierarchy tree from the chosen layout (heavy step — show top bar)
+# Load the workbook once (heavy step — show top bar) and work out which header
+# row carries the wave/period labels, so Step 2 can offer them as dropdowns.
 _top_bar(True)
 try:
     with st.spinner("Loading the workbook and scanning the selected sheet…"):
-        # Load the workbook ONCE here; reused for the tree and the run below.
         _xl_hash = hash(excel_bytes)
         ws_loaded = load_worksheet(_xl_hash, excel_bytes, sheet)
-        tree = build_tree(_xl_hash, (sheet, _xl_hash), tuple(header_rows),
-                          int(letter_row), int(label_col),
-                          current_label, benchmark_label, ws_loaded)
+        engine.HEADER_ROWS = header_rows
+        _wave_row, _wave_choices = engine.detect_wave_label_row(ws_loaded)
 except Exception as exc:
     _top_bar(False)
-    st.error(f"Couldn't read the header hierarchy with these layout settings: {exc}")
+    st.error(f"Couldn't read the sheet with these layout settings: {exc}")
     st.stop()
 _top_bar(False)
 
-paths_raw = tree["paths"]
-paths  = [p for (p, _col) in paths_raw]   # bare path tuples for cascading
-levels = tree["levels"]
-if not paths:
+if len(_wave_choices) < 2:
     st.error(
-        f"No '{current_label}' / '{benchmark_label}' columns were found with "
-        "these layout settings. Check that those labels match the Excel exactly, "
-        "and check the header rows and sheet."
+        "Couldn't find a header row containing two or more repeated column "
+        "labels (the row holding things like 'Wave 5' / 'Wave 4'). Check the "
+        "header rows in Step 1."
     )
     st.stop()
 
-st.success(f"Found {len(paths)} column cuts across {levels} hierarchy levels.")
-
 
 # ── STEP 2 — Core settings (cascading dropdowns, unlocked after layout) ───────
-st.subheader("2 · Default column cut")
+st.subheader("2 · Columns to compare")
 st.caption(
-    "Pick the column the tool uses for every shape unless overridden. Each level "
-    "unlocks the next."
+    "Pick the row that holds the period labels, then choose which label is "
+    "being reported on and which it's measured against."
 )
+
+# Which header row carries the period labels. Detected automatically, but the
+# user can override it since it isn't always the same row.
+_row_opts = list(header_rows)
+_row_idx = _row_opts.index(_wave_row) if _wave_row in _row_opts else len(_row_opts) - 1
+wave_row = st.selectbox(
+    "Period label row",
+    _row_opts,
+    index=_row_idx,
+    key="wave_row",
+    format_func=lambda r: f"Row {r}" + ("  (detected)" if r == _wave_row else ""),
+    help="The header row containing labels like 'Wave 5' / 'Wave 4'.",
+)
+
+_wave_choices = engine.row_label_values(ws_loaded, int(wave_row))
+if len(_wave_choices) < 2:
+    st.error(
+        f"Row {wave_row} has fewer than two distinct labels, so there's nothing "
+        "to compare. Pick a different row above, or check the header rows in "
+        "Step 1."
+    )
+    st.stop()
+
+# Which two columns are compared. Options come from the detected label row, so
+# they always match the Excel exactly — no typing required.
+def _default_idx(preferred, choices, fallback):
+    for want in preferred:
+        if want in choices:
+            return choices.index(want)
+    return fallback
+
+for _k in ("current_label", "benchmark_label"):
+    if _k in st.session_state and st.session_state[_k] not in _wave_choices:
+        del st.session_state[_k]
+
+wl1, wl2 = st.columns(2)
+with wl1:
+    current_label = st.selectbox(
+        "Current column",
+        _wave_choices,
+        index=_default_idx([engine.CURRENT_LABEL], _wave_choices,
+                           len(_wave_choices) - 1),
+        key="current_label",
+        help="The period being reported on — the numbers shown on the slides.",
+    )
+with wl2:
+    benchmark_label = st.selectbox(
+        "Benchmark column",
+        _wave_choices,
+        index=_default_idx([engine.BENCHMARK_LABEL], _wave_choices, 0),
+        key="benchmark_label",
+        help="The period it is compared against. ▲/▼ mark significant "
+             "differences between the two.",
+    )
+
+if current_label == benchmark_label:
+    st.error("The current and benchmark columns must be different.")
+    st.stop()
+
+st.caption(f"Comparing **{current_label}** against **{benchmark_label}** — ▲/▼ "
+           f"mark significant movement in {current_label}.")
+
+# Now the hierarchy tree can be built, since it depends on the chosen labels.
+# Apply the settings on every rerun — build_tree may be served from cache, in
+# which case its own assignments don't run.
+apply_engine_layout(header_rows, letter_row, label_col,
+                    current_label, benchmark_label, wave_row)
+
+_top_bar(True)
+try:
+    with st.spinner("Reading the column hierarchy…"):
+        tree = build_tree(_xl_hash, (sheet, _xl_hash), tuple(header_rows),
+                          int(letter_row), int(label_col),
+                          current_label, benchmark_label, int(wave_row),
+                          ws_loaded)
+    # build_tree may have reset these if it executed; re-assert the current ones.
+    apply_engine_layout(header_rows, letter_row, label_col,
+                        current_label, benchmark_label, wave_row)
+except Exception as exc:
+    _top_bar(False)
+    st.error(f"Couldn't read the header hierarchy: {exc}")
+    st.stop()
+_top_bar(False)
+
+paths  = [p for (p, _col) in tree["paths"]]
+levels = tree["levels"]
+if not paths:
+    st.error(
+        f"No '{current_label}' / '{benchmark_label}' column pairs were found. "
+        "Check the header rows and sheet in Step 1."
+    )
+    st.stop()
+st.success(f"Found {len(paths)} column cuts across {levels} hierarchy levels.")
+
+st.markdown("**Default column cut**")
+st.caption("The column the tool uses for every shape unless overridden. "
+           "Each level unlocks the next.")
 
 BLANK = "—"
 chosen_default = []
@@ -502,7 +583,7 @@ st.caption("Selected cut → " + " > ".join(c if c else "—" for c in chosen_de
 # Show which Excel columns this cut actually resolves to. A blank level simply
 # isn't used to narrow the match, so it's worth confirming the result.
 try:
-    _b, _c = engine.wave_labels()
+    _b, _c = benchmark_label, current_label
     _w4, _w5, _l4, _l5 = engine.find_wave_columns(
         ws_loaded, [c for c in chosen_default if c])
     st.caption(
@@ -633,6 +714,7 @@ if run and pptx_file is not None:
     engine.HEADER_ROWS     = header_rows
     engine.CURRENT_LABEL   = current_label
     engine.BENCHMARK_LABEL = benchmark_label
+    engine.WAVE_ROW        = int(wave_row)
     engine.LETTER_ROW      = int(letter_row)
     engine.LABEL_COL       = int(label_col)
     engine.DEFAULT_CUT     = [c for c in chosen_default]
