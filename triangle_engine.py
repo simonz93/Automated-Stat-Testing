@@ -101,10 +101,14 @@ MIN_DIFF_PCT = 4
 CURRENT_LABEL   = "Wave 5"
 BENCHMARK_LABEL = "Wave 4"
 
+# Which header row carries the period labels. None = detect automatically;
+# set to a row number to override (the UI lets the user pick).
+WAVE_ROW = None
+
 # Bumped whenever app.py starts relying on something new in this file. app.py
 # checks it on startup so a stale engine is reported clearly instead of failing
 # later with a confusing AttributeError.
-ENGINE_API_VERSION = 5
+ENGINE_API_VERSION = 6
 
 
 def wave_labels():
@@ -401,8 +405,68 @@ def find_wave_columns(ws, *cuts):
 
 # ── Header value scanning (for UI dropdowns) ──────────────────────────────────
 
+def row_label_values(ws, row):
+    """Distinct non-empty values in `row`, in column order (skips column 1)."""
+    values, seen = [], set()
+    for c in range(2, ws.max_column + 1):
+        v = ws.cell(row=row, column=c).value
+        t = "" if v is None else str(v).strip()
+        if t and t not in seen:
+            seen.add(t)
+            values.append(t)
+    return values
+
+
+def detect_wave_label_row(ws):
+    """
+    Find the header row that holds the current/benchmark labels WITHOUT knowing
+    what those labels are, so the UI can offer them as choices.
+
+    The wave row is the header row whose values repeat the most: it carries only
+    a handful of distinct labels (typically two) spread across many columns,
+    whereas the hierarchy rows above it hold many distinct group names.
+    Returns (row_number, [distinct values in column order]) or (None, []).
+    """
+    best = (None, [], -1.0)
+    for r in HEADER_ROWS:
+        values, seen = [], set()
+        total = 0
+        for c in range(2, ws.max_column + 1):
+            v = ws.cell(row=r, column=c).value
+            if v is None:
+                continue
+            t = str(v).strip()
+            if not t:
+                continue
+            total += 1
+            if t not in seen:
+                seen.add(t)
+                values.append(t)
+        # Need at least two distinct labels, each appearing more than once.
+        if len(values) < 2 or total < 2 * len(values):
+            continue
+        repetition = total / len(values)
+        if repetition > best[2]:
+            best = (r, values, repetition)
+    if best[0] is not None:
+        return best[0], best[1]
+    # Fall back to the deepest header row, which is where the labels normally sit.
+    if HEADER_ROWS:
+        r = max(HEADER_ROWS)
+        values, seen = [], set()
+        for c in range(2, ws.max_column + 1):
+            v = ws.cell(row=r, column=c).value
+            t = "" if v is None else str(v).strip()
+            if t and t not in seen:
+                seen.add(t); values.append(t)
+        return r, values
+    return None, []
+
+
 def find_wave_row(ws):
     """Return the header row holding the current/benchmark wave labels."""
+    if WAVE_ROW:
+        return int(WAVE_ROW)
     bench_lbl, curr_lbl = wave_labels()
     for r in HEADER_ROWS:
         for c in range(1, ws.max_column + 1):
