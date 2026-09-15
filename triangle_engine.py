@@ -90,6 +90,27 @@ DEFAULT_SUB_COLUMN = "Total"
 # Minimum rounded percentage-point difference to show a triangle
 MIN_DIFF_PCT = 4
 
+# ── WAVE / PERIOD LABELS ──────────────────────────────────────────────────────
+# The two column labels compared against each other, as they appear in the
+# wave-label header row of the Excel.
+#   CURRENT_LABEL   — the wave being reported on (the number shown on slides)
+#   BENCHMARK_LABEL — the wave it is compared against (the prior/benchmark wave)
+# A triangle is applied when CURRENT is significantly different from BENCHMARK.
+# These are overridable so the tool works for any pair (e.g. "Wave 6" vs
+# "Wave 5", "2026" vs "2025", "Q2" vs "Q1").
+CURRENT_LABEL   = "Wave 5"
+BENCHMARK_LABEL = "Wave 4"
+
+# Bumped whenever app.py starts relying on something new in this file. app.py
+# checks it on startup so a stale engine is reported clearly instead of failing
+# later with a confusing AttributeError.
+ENGINE_API_VERSION = 5
+
+
+def wave_labels():
+    """Return (benchmark_label, current_label) as stripped strings."""
+    return str(BENCHMARK_LABEL).strip(), str(CURRENT_LABEL).strip()
+
 # ── CUSTOM COLUMN TARGETING ───────────────────────────────────────────────────
 # Some shapes don't pull from the default region/sub-column (e.g. "Rest of the
 # world > Total"). List those exceptions here. Each entry says: on this slide,
@@ -163,15 +184,15 @@ def clean_sig(val):
 
 
 def _pct_suffix(pct):
-    """Return ' (W4: X% → W5: Y%)' from a (p4, p5) tuple, or '' if unavailable."""
+    """Return ' (<benchmark>: X% → <current>: Y%)' from a (p4, p5) tuple."""
     if not pct:
         return ""
     p4, p5 = pct
     parts = []
     if p4 is not None:
-        parts.append(f"W4: {p4}%")
+        parts.append(f"{BENCHMARK_LABEL}: {p4}%")
     if p5 is not None:
-        parts.append(f"W5: {p5}%")
+        parts.append(f"{CURRENT_LABEL}: {p5}%")
     return f" ({' → '.join(parts)})" if parts else ""
 
 
@@ -304,13 +325,14 @@ def build_header_tree(ws):
       ('Country', 'Rest of the world', '', 'Total').
     Only one entry per distinct path is kept (Wave 4 column is enough to map it).
     """
+    bench_lbl, curr_lbl = wave_labels()
     wave_row = find_wave_row(ws)
     levels = [r for r in HEADER_ROWS if wave_row is None or r < wave_row]
     seen = set()
     paths = []
     for col in range(2, ws.max_column + 1):
         v = ws.cell(row=wave_row, column=col).value if wave_row else None
-        if not v or str(v).strip() not in ("Wave 4", "Wave 5"):
+        if not v or str(v).strip() not in (bench_lbl, curr_lbl):
             continue
         p = tuple(get_col_path(ws, col))
         if p in seen:
@@ -336,9 +358,14 @@ def find_wave_columns(ws, *cuts):
         cuts = tuple(cuts[0])
     match_set = {str(c).strip() for c in cuts if str(c).strip()}
 
+    bench_lbl, curr_lbl = wave_labels()
     wave_row = find_wave_row(ws)
     if wave_row is None:
-        sys.exit("ERROR: Could not find Wave 4 / Wave 5 label row in HEADER_ROWS")
+        raise ValueError(
+            f"Could not find a row containing the labels '{bench_lbl}' and "
+            f"'{curr_lbl}' within the header rows {HEADER_ROWS}. Check the "
+            f"current/benchmark column names and the header row settings."
+        )
 
     w4 = w5 = None
     for col in range(2, ws.max_column + 1):
@@ -346,19 +373,25 @@ def find_wave_columns(ws, *cuts):
         if v is None:
             continue
         wave_val = str(v).strip()
-        if wave_val not in ("Wave 4", "Wave 5"):
+        if wave_val not in (bench_lbl, curr_lbl):
             continue
         if match_set.issubset(get_col_ancestry(ws, col)):
-            if wave_val == "Wave 4" and w4 is None:
+            if wave_val == bench_lbl and w4 is None:
                 w4 = col
-            elif wave_val == "Wave 5" and w5 is None:
+            elif wave_val == curr_lbl and w5 is None:
                 w5 = col
         if w4 and w5:
             break
 
     if not w4 or not w5:
-        sys.exit(
-            f"ERROR: No Wave 4 / Wave 5 column pair matching {sorted(match_set)}"
+        missing = []
+        if not w4:
+            missing.append(f"'{bench_lbl}' (benchmark)")
+        if not w5:
+            missing.append(f"'{curr_lbl}' (current)")
+        raise ValueError(
+            f"No {' and '.join(missing)} column found for "
+            f"{sorted(match_set)}."
         )
     lw4 = clean_sig(ws.cell(row=LETTER_ROW, column=w4).value)
     lw5 = clean_sig(ws.cell(row=LETTER_ROW, column=w5).value)
@@ -369,11 +402,12 @@ def find_wave_columns(ws, *cuts):
 # ── Header value scanning (for UI dropdowns) ──────────────────────────────────
 
 def find_wave_row(ws):
-    """Return the row number within HEADER_ROWS that holds the Wave 4/5 labels."""
+    """Return the header row holding the current/benchmark wave labels."""
+    bench_lbl, curr_lbl = wave_labels()
     for r in HEADER_ROWS:
         for c in range(1, ws.max_column + 1):
             v = ws.cell(row=r, column=c).value
-            if v and str(v).strip() in ("Wave 4", "Wave 5"):
+            if v and str(v).strip() in (bench_lbl, curr_lbl):
                 return r
     return None
 
@@ -415,7 +449,12 @@ def section_rows(ws, start, end, w4, w5, lw4, lw5):
         sig_w5 = clean_sig(ws.cell(row=r + 1, column=w5).value)
         sig_w4 = clean_sig(ws.cell(row=r + 1, column=w4).value)
         tri = None
-        if p4 is not None and p5 is not None and abs(p5 - p4) >= MIN_DIFF_PCT:
+        # No comparison is possible unless BOTH waves have a real numeric value.
+        # A missing previous wave (blank, "-", "—", "n/a", "*", etc.) yields
+        # p4 = None here, so no triangle is applied — there is nothing to compare
+        # the current wave against.
+        prev_wave_missing = p4 is None
+        if not prev_wave_missing and p5 is not None and abs(p5 - p4) >= MIN_DIFF_PCT:
             if sig_w5 == lw4:
                 tri = TRIANGLE_UP
             elif sig_w4 == lw5:
@@ -1401,7 +1440,7 @@ def process_shape(slide_num, slide, shape, spec, section_data, cut, report_rows)
                 if not numbers_match(shown_pct, p5):
                     print(f"  '{shape.name}' → DATA NOT FOUND (shown {shown_pct}% ≠ column {p5}%)")
                     report_rows.append({**base, "status": STATUS_MISSING,
-                                        "items_applied": f"shown {shown_pct}% ≠ column W5 {p5}% (LINK {link_code} rank {rank})",
+                                        "items_applied": f"shown {shown_pct}% ≠ {CURRENT_LABEL} column {p5}% (LINK {link_code} rank {rank})",
                                         "triangles_added": 0})
                     return 0
                 tri = by_label.get(norm)
@@ -1429,7 +1468,7 @@ def process_shape(slide_num, slide, shape, spec, section_data, cut, report_rows)
             if not numbers_match(shown_pct, p5):
                 print(f"  '{shape.name}' → DATA NOT FOUND (shown {shown_pct}% ≠ column {p5}%)")
                 report_rows.append({**base, "status": STATUS_MISSING,
-                                    "items_applied": f"shown {shown_pct}% ≠ column W5 {p5}% (rank {rank})",
+                                    "items_applied": f"shown {shown_pct}% ≠ {CURRENT_LABEL} column {p5}% (rank {rank})",
                                     "triangles_added": 0})
                 return 0
             if tri:
@@ -1467,7 +1506,7 @@ def process_shape(slide_num, slide, shape, spec, section_data, cut, report_rows)
         if not numbers_match(shown_pct, _pct[1] if _pct else None):
             print(f"  '{shape.name}' → DATA NOT FOUND (shown {shown_pct}% ≠ column {_pct[1]}%)")
             report_rows.append({**base, "status": STATUS_MISSING,
-                                "items_applied": f"shown {shown_pct}% ≠ column W5 {_pct[1]}%",
+                                "items_applied": f"shown {shown_pct}% ≠ {CURRENT_LABEL} column {_pct[1]}%",
                                 "triangles_added": 0})
             return 0
 
